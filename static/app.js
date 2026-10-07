@@ -276,39 +276,56 @@ async function poll() {
   // 历史列表尽力刷新：仍处于活动态时下一轮轮询会继续；终态后历史本就
   // 冻结。这一步慢/失败都不影响上面已经完成的终态收尾。
   const latest = await fetchPauses(myRunId);
-  if (newRunTookOver()) return;
+  if (newRunTookOver()) return;  // 旧运行在途响应不得改动新获准运行的页面
+  // 淘汰只由“当前运行的最新有效历史”作证：仅当本轮成功拿到本运行的
+  // 列表、且它不旧于已采纳高水位（同代幂等、新代采纳）时才更新凭据。
+  // /api/pauses 未返回/409/网络失败（latest 为 null）或只拿到更旧轮询
+  // 的列表时凭据不足，绝不能把仍在回看的停顿误判为已淘汰。
+  let evictionConfirmed = false;
   if (latest && !pausesIsOlder(latest, pauses)) {
+    if (inHistoryMode()
+        && pauses.some((p) => String(p.pause_seq) === viewingSeq)
+        && !latest.some((p) => String(p.pause_seq) === viewingSeq)) {
+      evictionConfirmed = true;
+    }
     // 较新轮询已经采纳更新的列表时，较早轮询的旧列表（如只含停顿 #1）
     // 不得覆盖：否则选中停顿 #2 后会被误判“已淘汰”并退出回看。
     pauses = latest;
   }
-  populateHistory();
 
-  // 终态收尾期间（上面的 await）可能已有更晚轮询采纳终态；非终态的迟到
-  // 轮询不得在这之后重渲活动视图、重新启用步进/继续或恢复只读。
-  if (liveState && isTerminal(liveState.status)) {
-    if (inHistoryMode()) {
-      const selected = pauses.find((p) => String(p.pause_seq) === viewingSeq);
-      if (selected) renderHistory(selected);  // 终态后仍可回看所选停顿
-    } else {
-      renderView(liveState);  // 历史在途时也能定格终态视图
-    }
-    return;
-  }
-
+  // 活动态与终态走同一条“所选记录归属”判断。终态收尾（上面的 await）
+  // 期间可能已有更晚轮询采纳更新或终态状态：统一以高水位 liveState
+  // 渲染，较早轮询不得在这之后重渲更旧视图、恢复只读或点亮单步/继续。
   if (inHistoryMode()) {
     const selected = pauses.find((p) => String(p.pause_seq) === viewingSeq);
     if (selected) {
-      // 轮询继续更新实时状态（徽标/下拉），但不切走所选历史记录
+      // 所选停顿仍在最新有效历史中（含终态之后）：保持回看；轮询只让
+      // 徽标/下拉前进，不切走所选记录，单步/继续继续禁用。
+      populateHistory();  // 列表可能增长（含淘汰其他旧记录），同步下拉框
       renderHistory(selected);
+    } else if (evictionConfirmed) {
+      // 当前运行的最新有效历史已确认所选停顿淘汰——下一次采纳的就是
+      // 结束/异常/终止也一样：提示并退出回看、清空选择，改展示已采纳
+      // 状态本身（终态下即最终源码视图、stdout 与异常）；renderView
+      // 对终态保持单步/继续禁用，运行按钮与源码编辑已在收尾时恢复。
+      // 先抓下序号：exitHistoryView 会把 viewingSeq 置空。还必须在退出
+      // 回看之后再重建下拉框：先按含已淘汰序号的旧列表重建再清空选择，
+      // 会让值落到不存在的选项上、框内残留被淘汰停顿。
+      const evictedSeq = viewingSeq;
+      exitHistoryView();
+      populateHistory();
+      showMessage(
+        `停顿 #${evictedSeq} 已超出最近保留条数被淘汰，已返回实时视图`);
+      renderView(liveState);
     } else {
-      // 所选记录确实已被淘汰（列表已被采纳为最新且仍不含它）：提示并
-      // 返回实时视图（liveState 刚刷新过）
-      showLive(liveState,
-        `停顿 #${viewingSeq} 已超出最近保留条数被淘汰，已返回实时视图`);
+      populateHistory();  // 凭据不足，列表未变：幂等保留当前选择
     }
+    // 历史未返回/请求失败，或仅拿到更旧轮询的列表：凭据不足，继续定格
+    // 已采纳的所选快照，不提示、不退出回看。终态收尾（停轮询、恢复编辑
+    // 与重跑）在采纳终态时已经同步完成，不受影响。
   } else {
-    renderView(data);
+    populateHistory();
+    renderView(liveState);  // 历史在途时也能立即定格终态视图
   }
 }
 
@@ -442,13 +459,6 @@ function exitHistoryView() {
   viewingSeq = null;
   $("history").value = "";
   $("history-banner").hidden = true;
-}
-
-function showLive(state, message) {
-  // 用给定（最新）状态切回实时视图并据此重新启用/禁用控制
-  exitHistoryView();
-  showMessage(message || "");
-  renderView(state);
 }
 
 async function returnToLive() {

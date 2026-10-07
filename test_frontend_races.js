@@ -31,7 +31,17 @@
  *    /api/pauses never returns; the frozen history stays reviewable and a
  *    freshly admitted run is untouched by the old run's parked replies;
  *  - a genuine eviction (a strictly newer adopted list no longer contains
- *    the selected pause) still reports and returns to live.
+ *    the selected pause) still reports and returns to live;
+ *  - TERMINAL REVIEW EVICTION: while reviewing a pause, the NEXT adopted
+ *    state being finished/exception/terminated with the freshest history
+ *    retaining only later pauses must prompt, exit review and clear the
+ *    selection, then show the adopted terminal source view, stdout and
+ *    exception with step/continue disabled; if the selected pause is still
+ *    retained the review stays; a missing/failed/409 /api/pauses (or an
+ *    older poll's list) is never enough to claim eviction, though terminal
+ *    finalization still happens immediately; and an old run's evicting
+ *    pauses reply released after a new run is admitted cannot touch the new
+ *    page.
  *
  * Run standalone:        node test_frontend_races.js
  * Run via the suite:     python3 -m unittest test_races -v
@@ -727,14 +737,16 @@ async function scenarioTerminalFinalizationIndependentOfPauses() {
     [pause(1, 1, {}), pause(2, 2, { x: "1" })]);
 
   // A poll observes the terminal state; its pauses follow-up is parked and
-  // never answered in this scenario.
-  const terminalChain = evalApp("poll()");
+  // never answered in this scenario. The poll() promise therefore stays
+  // pending too -- do NOT await it (an unresolved fetch would deadlock the
+  // harness with no timers left): one tick after the follow-up is issued is
+  // enough for every synchronous post-state effect to land.
+  evalApp("poll()");
   await tick();
   take(isState, "[8] terminal state request")
     .resolve(jsonResponse(200, state("run8", "finished", 2)));
   await tick();
   const parkedPauses = take(pausesFor("run8"), "[8] parked pauses request");
-  await terminalChain;
   await tick();
 
   // Finalization already happened: page editable, rerun enabled, polling
@@ -750,12 +762,11 @@ async function scenarioTerminalFinalizationIndependentOfPauses() {
   // More overlapping polls holding terminal states, each with an
   // unanswered pauses follow-up: nothing re-locks the page.
   for (let i = 0; i < 3; i++) {
-    const p = evalApp("poll()");
+    evalApp("poll()");  // parked follow-up keeps the promise pending
     await tick();
     take(isState).resolve(jsonResponse(200, state("run8", "finished", 2)));
     await tick();
     take(pausesFor("run8"), `[8] trailing pauses ${i}`);  // parked, not answered
-    await p;
     await tick();
     eq(elements.code.readOnly, false, `[8] still editable after trailing poll ${i}`);
     eq(activeIntervals().length, 0, `[8] polling stays stopped ${i}`);
@@ -836,6 +847,269 @@ async function scenarioGenuineEvictionStillReported() {
   check(!elements["btn-step"].disabled, "[9] controls re-enabled back live");
 }
 
+// ===========================================================================
+// Scenario 10: TERMINAL REVIEW EVICTION. The user reviews pause #1; the next
+// adopted state is a terminal one (finished / exception / terminated) and the
+// current run's freshest valid history retains only pauses #2..#101. The page
+// must prompt, exit review, clear the selection and show the adopted terminal
+// source view, stdout and exception, with step/continue disabled. When the
+// reviewed pause is still retained, review stays. A missing / failed / 409
+// /api/pauses (or an older poll's shorter list) must never be read as an
+// eviction, while terminal finalization (polling stopped, editor unlocked,
+// re-run enabled) still happens immediately; an old run's evicting reply
+// released after a new run's admission must not change the new page.
+// ===========================================================================
+
+function retainedAfterEvictingOne() {
+  // Server-side rule: the surviving records keep their ORIGINAL seq numbers,
+  // so after #1 is evicted the window starts at #2 and ends at #101.
+  const kept = [];
+  for (let seq = 2; seq <= 101; seq++) {
+    kept.push(pause(seq, seq, { i: String(seq) }));
+  }
+  return kept;
+}
+
+// A 101-line source listing so the terminal state's current_line=101 has a
+// real row to highlight (the default state() factory only carries 3 lines).
+const LONG_LINES = Array.from({ length: 101 }, (_, i) => `line ${i + 1}`);
+
+async function scenarioTerminalReviewEviction() {
+  await resetForScenario();
+
+  const cases = [
+    { status: "finished", badge: "已结束" },
+    { status: "exception", badge: "异常终止" },
+    { status: "terminated", badge: "已终止" },
+  ];
+  for (const c of cases) {
+    // Each terminal kind starts from its own freshly admitted run: reach
+    // pause #1, review it, then adopt the terminal state together with an
+    // evicting history window (#2..#101).
+    await admitRun("run10-" + c.status);
+    await answerPoll("run10-" + c.status,
+      state("run10-" + c.status, "paused", 1), [pause(1, 1, {})]);
+    elements.history.value = "1";
+    elements.history.dispatch("change", { target: elements.history });
+    await tick();
+    eq(elements["history-banner"].hidden, false,
+      `[10] ${c.status}: reviewing pause #1`);
+
+    const chain = evalApp("poll()");
+    await tick();
+    take(isState).resolve(jsonResponse(200,
+      state("run10-" + c.status, c.status, 101, {
+        current_line: 101,
+        stdout: "FINAL-OUTPUT-" + c.status,
+        exception: c.status === "exception" ? "ZeroDivisionError: boom" : null,
+        lines: LONG_LINES,
+      })));
+    await tick();
+    take(pausesFor("run10-" + c.status), `[10] ${c.status} pauses`).resolve(
+      jsonResponse(200, {
+        run_id: "run10-" + c.status,
+        pauses: retainedAfterEvictingOne(),
+      }));
+    await chain;
+    await tick();
+
+    eq(elements.message.textContent,
+      "停顿 #1 已超出最近保留条数被淘汰，已返回实时视图",
+      `[10] ${c.status}: eviction is reported`);
+    eq(elements["history-banner"].hidden, true,
+      `[10] ${c.status}: review exited`);
+    eq(elements.history.value, "",
+      `[10] ${c.status}: dropdown selection cleared`);
+    eq(elements.status.textContent, c.badge,
+      `[10] ${c.status}: terminal badge shown`);
+    eq(elements.stdout.textContent, "FINAL-OUTPUT-" + c.status,
+      `[10] ${c.status}: final stdout shown, not the frozen snapshot`);
+    eq(elements.exception.textContent,
+      c.status === "exception" ? "ZeroDivisionError: boom" : "",
+      `[10] ${c.status}: exception panel reflects the terminal state`);
+    // renderListing highlights the next-to-run line for exception/terminate
+    // (the killed/raised line) and suppresses it for a clean finish.
+    eq(markedLine(), c.status === "finished" ? null : 101,
+      `[10] ${c.status}: terminal source view rendered`);
+    check(elements["btn-step"].disabled,
+      `[10] ${c.status}: step stays unavailable`);
+    check(elements["btn-continue"].disabled,
+      `[10] ${c.status}: continue stays unavailable`);
+    check(!elements["btn-run"].disabled,
+      `[10] ${c.status}: re-run available`);
+    check(elements["btn-terminate"].disabled,
+      `[10] ${c.status}: terminate disabled`);
+    eq(elements.code.readOnly, false,
+      `[10] ${c.status}: editor unlocked`);
+    eq(activeIntervals().length, 0,
+      `[10] ${c.status}: polling stopped`);
+    check(!optionTexts().some((t) => t.startsWith("停顿 #1（")),
+      `[10] ${c.status}: evicted #1 absent from dropdown`);
+    check(optionTexts().some((t) => t.startsWith("停顿 #101（")),
+      `[10] ${c.status}: retained #101 selectable`);
+  }
+
+  // --- selected pause still retained at terminal: review must stay --------
+  await resetForScenario();
+  await admitRun("run10b");
+  await answerPoll("run10b", state("run10b", "paused", 1), [pause(1, 1, {})]);
+  elements.history.value = "1";
+  elements.history.dispatch("change", { target: elements.history });
+  await tick();
+  const kept = retainedAfterEvictingOne();
+  const chainKeep = evalApp("poll()");
+  await tick();
+  take(isState).resolve(jsonResponse(200, state("run10b", "finished", 101, {
+    current_line: 101,
+    stdout: "FINAL-KEEP",
+    exception: null,
+  })));
+  await tick();
+  // Window grew but #1 is still inside (#1..#100): no eviction.
+  take(pausesFor("run10b")).resolve(jsonResponse(200, {
+    run_id: "run10b", pauses: [pause(1, 1, {})].concat(kept.slice(0, 99)),
+  }));
+  await chainKeep;
+  await tick();
+  eq(elements["history-banner"].hidden, false,
+    "[10] retained selection stays in review at terminal");
+  eq(elements.message.textContent, "", "[10] no eviction notice");
+  eq(markedLine(), 1, "[10] review still freezes line 1");
+  eq(elements.stdout.textContent, "",
+    "[10] frozen snapshot stdout kept (final output not forced in)");
+  check(elements["btn-step"].disabled, "[10] step disabled while reviewing");
+  check(elements["btn-continue"].disabled,
+    "[10] continue disabled while reviewing");
+  eq(elements.code.readOnly, false, "[10] terminal editor still unlocked");
+  eq(activeIntervals().length, 0, "[10] terminal polling still stopped");
+
+  // --- pauses missing / failed / 409 at terminal: no false eviction --------
+  const failureVariants = [
+    (req) => req.resolve({
+      ok: false, status: 409, json: async () => ({ error: "运行不存在或已过期" }),
+    }),
+    (req) => req.resolve({
+      // 200 whose body cannot be decoded: fetchPauses must treat as failure.
+      ok: true, status: 200, json: async () => { throw new Error("bad json"); },
+    }),
+  ];
+  for (const fail of failureVariants) {
+    await resetForScenario();
+    await admitRun("run10c");
+    await answerPoll("run10c", state("run10c", "paused", 1),
+      [pause(1, 1, {})]);
+    elements.history.value = "1";
+    elements.history.dispatch("change", { target: elements.history });
+    await tick();
+    const chainFail = evalApp("poll()");
+    await tick();
+    take(isState).resolve(jsonResponse(200,
+      state("run10c", "exception", 101, {
+        current_line: 101,
+        stdout: "NEVER-SHOWN-IN-REVIEW",
+        exception: "ValueError: x",
+      })));
+    await tick();
+    fail(take(pausesFor("run10c"), "[10] failing pauses reply"));
+    await chainFail;
+    await tick();
+    // No evidence -> keep reviewing the frozen snapshot, no prompt.
+    eq(elements["history-banner"].hidden, false,
+      "[10] failed pauses cannot evict: review kept");
+    eq(elements.message.textContent, "",
+      "[10] failed pauses cannot evict: no notice");
+    eq(markedLine(), 1, "[10] still shows the reviewed pause #1");
+    eq(elements.stdout.textContent, "",
+      "[10] reviewed snapshot output stays (no final output)");
+    eq(elements.exception.textContent, "",
+      "[10] reviewed snapshot keeps empty exception panel");
+    // Terminal finalization is independent of the pauses reply.
+    eq(elements.status.textContent, "异常终止", "[10] badge still advances");
+    eq(elements.code.readOnly, false, "[10] editor unlocked despite failure");
+    eq(activeIntervals().length, 0, "[10] polling stopped despite failure");
+    check(!elements["btn-run"].disabled, "[10] re-run enabled despite failure");
+    check(elements["btn-step"].disabled && elements["btn-continue"].disabled,
+      "[10] step/continue disabled despite failure");
+  }
+
+  // --- older poll's shorter list at terminal cannot "evict" ---------------
+  await resetForScenario();
+  await admitRun("run10d");
+  await answerPoll("run10d", state("run10d", "paused", 2, { current_line: 2 }),
+    [pause(1, 1, {}), pause(2, 2, { x: "1" })]);
+  elements.history.value = "2";
+  elements.history.dispatch("change", { target: elements.history });
+  await tick();
+  // A single poll adopts the terminal state with a retained #2..#101 window.
+  const chainKeep2 = evalApp("poll()");
+  await tick();
+  take(isState).resolve(jsonResponse(200,
+    state("run10d", "finished", 101, { current_line: 101 })));
+  await tick();
+  take(pausesFor("run10d")).resolve(jsonResponse(200, {
+    run_id: "run10d",
+    pauses: [pause(2, 2, { x: "1" })].concat(retainedAfterEvictingOne().slice(1)),
+  }));
+  await chainKeep2;
+  await tick();
+  eq(elements["history-banner"].hidden, false,
+    "[10] #2 retained at terminal: review stays");
+  // A later poll built against an OLDER window (#1..#100, i.e. max seq 100 <
+  // the adopted 101) must be discarded as older, so it can never "evict" #2.
+  const chainOlder = evalApp("poll()");
+  await tick();
+  take(isState).resolve(jsonResponse(200,
+    state("run10d", "finished", 101, { current_line: 101 })));
+  await tick();
+  take(pausesFor("run10d")).resolve(jsonResponse(200, {
+    run_id: "run10d",
+    pauses: [pause(1, 1, {}), pause(2, 2, { x: "1" })]
+      .concat(Array.from({ length: 98 }, (_, k) => pause(3 + k, 3 + k))),
+  }));
+  await chainOlder;
+  await tick();
+  eq(elements.message.textContent, "",
+    "[10] older poll's short list never claims eviction");
+  eq(elements["history-banner"].hidden, false, "[10] review survives old list");
+  eq(markedLine(), 2, "[10] reviewed pause #2 still frozen");
+
+  // --- old run's evicting reply released after a NEW admission ------------
+  await resetForScenario();
+  await admitRun("run10e");
+  await answerPoll("run10e", state("run10e", "paused", 1), [pause(1, 1, {})]);
+  elements.history.value = "1";
+  elements.history.dispatch("change", { target: elements.history });
+  await tick();
+  // Terminal state adopted; pauses parked forever -> the poll() promise
+  // stays pending, so it must not be awaited (the harness would deadlock).
+  evalApp("poll()");
+  await tick();
+  take(isState).resolve(jsonResponse(200,
+    state("run10e", "finished", 101, { current_line: 101 })));
+  await tick();
+  const parkedOldPauses = take(pausesFor("run10e"),
+    "[10] parked old evicting pauses");
+  await tick();
+  // Finalization happens (pauses parked); now a new run is admitted.
+  eq(elements.code.readOnly, false, "[10] old run finalized while parked");
+  await admitRun("run10f");
+  eq(elements.code.readOnly, true, "[10] new run locks the editor");
+  // The old run's evicting reply (#2..#101) lands only now.
+  parkedOldPauses.resolve(jsonResponse(200,
+    { run_id: "run10e", pauses: retainedAfterEvictingOne() }));
+  await tick();
+  eq(elements.status.textContent, "运行中",
+    "[10] old evicting reply cannot change the new run's badge");
+  eq(elements.code.readOnly, true,
+    "[10] old evicting reply cannot unlock the new run");
+  eq(elements.message.textContent, "",
+    "[10] old evicting reply shows no notice on the new page");
+  check(!optionTexts().some((t) => t.includes("#101")),
+    "[10] old pauses never populate the new dropdown");
+  await answerPoll("run10f", state("run10f", "paused", 1), [pause(1, 1, {})]);
+  eq(elements.status.textContent, "已暂停", "[10] new run drives normally");
+}
+
 async function main() {
   await scenarioTwoOldPollChains();
   await scenarioLateStepResponse();
@@ -846,6 +1120,7 @@ async function main() {
   await scenarioStaleStateSameRun();
   await scenarioTerminalFinalizationIndependentOfPauses();
   await scenarioGenuineEvictionStillReported();
+  await scenarioTerminalReviewEviction();
   await tick();
   await flushTimeouts();
   if (failures) {
@@ -854,7 +1129,22 @@ async function main() {
   }
   console.log("\nall frontend cross-run async-chain checks passed");
 }
-main().catch((err) => {
+// A parked/unresolved fetch leaves its awaiting promise pending forever; if
+// a scenario accidentally awaits such a promise, the event loop drains and
+// Node exits 0 *before* main() finishes -- a silent, false-green truncation.
+// Fail loudly instead whenever the process reaches end-of-life without the
+// full scenario chain having completed.
+let mainCompleted = false;
+process.on("beforeExit", () => {
+  if (!mainCompleted) {
+    failures++;
+    console.error("FAIL - harness ended before all scenarios completed "
+      + "(a scenario awaited a promise parked on an unresolved fetch)");
+    process.exitCode = 1;
+  }
+});
+
+main().then(() => { mainCompleted = true; }).catch((err) => {
   console.error("harness error:", err.stack || err);
   process.exit(2);
 });
