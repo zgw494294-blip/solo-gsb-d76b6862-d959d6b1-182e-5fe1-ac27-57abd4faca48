@@ -289,7 +289,17 @@ async function poll() {
   if (liveState && isTerminal(liveState.status)) {
     if (inHistoryMode()) {
       const selected = pauses.find((p) => String(p.pause_seq) === viewingSeq);
-      if (selected) renderHistory(selected);  // 终态后仍可回看所选停顿
+      if (selected) {
+        renderHistory(selected);  // 所选停顿仍保留：终态后照常回看
+      } else {
+        // 最新有效历史已确认所选停顿被淘汰：提示、退出回看并清空选择，
+        // 改看已采纳终态的源码/输出/异常（终态下单步/继续保持禁用）。
+        // pauses 只来自成功返回且按单调高水位采纳的完整列表，不含所选即
+        // 确淘汰；历史未返回/请求失败时 pauses 不变、仍含所选停顿，不会
+        // 走到这里，不会误判淘汰。
+        showLive(liveState,
+          `停顿 #${viewingSeq} 已超出最近保留条数被淘汰，已退出回看并显示最终状态`);
+      }
     } else {
       renderView(liveState);  // 历史在途时也能定格终态视图
     }
